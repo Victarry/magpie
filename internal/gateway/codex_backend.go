@@ -3522,6 +3522,58 @@ func developerItemsAsSystem(body []byte) []byte {
 	return nb
 }
 
+// systemRoleRefused is how unfit remembers a Responses provider turning
+// away a message of role "system" ("KTH API: System messages are not
+// allowed"): a relay of the ChatGPT backend that enforces developer-only
+// roles even without codex=as-sent.
+func systemRoleRefused(model string) string { return "system role\x00" + model }
+
+var systemRoleRefusal = regexp.MustCompile(`(?i)system messages are not allowed|role['": ]+system\b.*not (?:allowed|supported)`)
+
+func refusesSystemRole(status int, b []byte) bool {
+	return badRequest(status) && systemRoleRefusal.Match(b)
+}
+
+// systemItemsAsDeveloper turns the system messages of a Responses request
+// into developer ones, where they stand, for a Responses relay that
+// refuses the system role.
+func systemItemsAsDeveloper(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"system"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if json.Unmarshal(body, &q) != nil {
+		return body
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(q["input"], &items) != nil {
+		return body
+	}
+	changed := false
+	out := make([]json.RawMessage, 0, len(items))
+	for _, raw := range items {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var it map[string]any
+		if dec.Decode(&it) == nil && (it["type"] == nil || it["type"] == "message") && it["role"] == "system" {
+			it["role"] = "developer"
+			if b, err := marshalPlain(it); err == nil {
+				raw, changed = b, true
+			}
+		}
+		out = append(out, raw)
+	}
+	if !changed {
+		return body
+	}
+	q["input"], _ = marshalPlain(out)
+	nb, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return nb
+}
+
 func userMessage(text string) map[string]any { return codexsummary.UserMessage(text) }
 
 // compactWithin is how long a compaction's summary is waited for before
@@ -3884,12 +3936,12 @@ func inputKindRefused(rec *recorder, err error) bool {
 	return inputKindWords.Match(rec.body.Bytes())
 }
 
-var inputKindWords = regexp.MustCompile(`(?i)unsupported_input_item|unknown item type`)
+var inputKindWords = regexp.MustCompile(`(?i)unsupported_input_item|unknown item type|system messages are not allowed`)
 
 // compactFailure names who answered a summary request with a failure — the
 // provider, the model and the provider's base URL — and what it said.
 func compactFailure(body []byte, rec *recorder) (who, msg string) {
-	model := modelOf(body)
+	model := unprefixed(modelOf(body))
 	who = cmp.Or(rec.header.Get(providerHeader), strings.SplitN(model, "/", 2)[0]) +
 		" (" + cmp.Or(rec.header.Get(modelHeader), model)
 	if p, _, ok := provider.Resolve(model); ok {

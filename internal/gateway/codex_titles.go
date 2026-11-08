@@ -711,6 +711,7 @@ func titleJSON(said string, shape titleShape) string {
 // levels aren't known goes as asked (serve's effortRequired retry then
 // asks the last at low if it turns the request away).
 func codexSideEffort(body []byte, to string) []byte {
+	to = unprefixed(to)
 	if provider.IsGroupRef(to) {
 		return body
 	}

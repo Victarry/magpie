@@ -698,3 +698,42 @@ func TestHeldTurnOwnsItsInput(t *testing.T) {
 		t.Fatalf("held after the frame was written over: %s", got)
 	}
 }
+
+func TestResponsesSocketAddsStreamAndTurnMetadataHeaders(t *testing.T) {
+	fresh(t)
+	u := &respUp{}
+	sockUp(t, u)
+	p, err := provider.Find("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.PassHeaders = []string{"originator", "x-codex-turn-metadata", "x-codex-window-id"}
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	_, ts := sockServer(t)
+	h := http.Header{
+		"User-Agent": {"codex_cli_rs/0.162.1"},
+		"Originator": {"codex_cli_rs"},
+	}
+	c, _, err := dialSock(t, ts, CodexPath+"/responses", h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := `{"type":"response.create","model":"fake/m1","store":false,"input":[` + userHi + `],` +
+		`"client_metadata":{"x-codex-turn-metadata":"{\"turn_id\":\"t1\"}","x-codex-window-id":"w1:0","session_id":"s1"}}`
+	got := c.turn(frame)
+	if last(got).Get("type").String() != "response.completed" {
+		t.Fatalf("turn failed: %v", got)
+	}
+	if u.calls() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", u.calls())
+	}
+	if !gjson.GetBytes(u.body(0), "stream").Bool() {
+		t.Errorf("upstream body missing stream:true: %s", u.body(0))
+	}
+	uh := u.head[0]
+	if uh.Get("X-Codex-Turn-Metadata") != `{"turn_id":"t1"}` || uh.Get("X-Codex-Window-Id") != "w1:0" {
+		t.Errorf("upstream headers missing turn/window metadata: %v", uh)
+	}
+}

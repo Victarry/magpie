@@ -492,6 +492,9 @@ func (rs *responsesSocket) turn(ctx context.Context, t *socketTurnRun, frame []b
 	delete(q, "type")
 	delete(q, "previous_response_id")
 	delete(q, "generate")
+	if _, ok := q["stream"]; !ok {
+		q["stream"] = json.RawMessage("true")
+	}
 	body, err := turnBody(q, input)
 	if err != nil {
 		rs.writeError(ctx, http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error(), "")
@@ -629,6 +632,19 @@ func (rs *responsesSocket) request(ctx context.Context, body []byte) *http.Reque
 	// (codexSocketMessage, the other way)
 	if v := gjson.GetBytes(body, `client_metadata.x-codex-turn-state`).String(); v != "" {
 		req.Header.Set("X-Codex-Turn-State", v)
+	}
+	for _, pair := range [][2]string{
+		{"x-codex-turn-metadata", "X-Codex-Turn-Metadata"},
+		{"x-codex-window-id", "X-Codex-Window-Id"},
+		{"x-codex-installation-id", "X-Codex-Installation-Id"},
+		{"session_id", "Session_id"},
+		{"thread_id", "Thread-Id"},
+	} {
+		if req.Header.Get(pair[1]) == "" {
+			if v := gjson.GetBytes(body, "client_metadata."+pair[0]).String(); v != "" {
+				req.Header.Set(pair[1], v)
+			}
+		}
 	}
 	if strings.EqualFold(gjson.GetBytes(body, `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite`).String(), "true") {
 		req.Header.Set("X-OpenAI-Internal-Codex-Responses-Lite", "true")

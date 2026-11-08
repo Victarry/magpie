@@ -521,7 +521,7 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 			if ag {
 				d["parameters"] = plainSchema(schema)
 			} else {
-				d["parametersJsonSchema"] = schema
+				d["parametersJsonSchema"] = geminiJSONSchema(schema)
 			}
 			decls = append(decls, d)
 		}
@@ -574,7 +574,7 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 		// the answer as JSON, of the client's schema when it gave one
 		gen["responseMimeType"] = "application/json"
 		if sc := r.Format.schema(); len(sc) > 0 {
-			gen["responseJsonSchema"] = sc
+			gen["responseJsonSchema"] = geminiJSONSchema(sc)
 		}
 	}
 	if catalog.DrawsID(sent) || r.draws {

@@ -165,3 +165,28 @@ func TestGeminiToolTypesDropsBooleansAndXKeys(t *testing.T) {
 		t.Error("a non-Gemini body was changed")
 	}
 }
+
+func TestGeminiRefLoopInAdditionalProperties(t *testing.T) {
+	reqBody := `{"model":"kth-argon/gemini-4-argon","input":"hi","tools":[{"type":"function","name":"mcp__codex_app__request_environment_input","parameters":{"type":"object","properties":{"mode":{"type":"string"},"secrets":{"type":"array","items":{"type":"object","properties":{"target":{"$ref":"#/$defs/__schema0"}},"additionalProperties":false}}},"additionalProperties":false,"$defs":{"__schema0":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},{"type":"null"},{"type":"array","items":{"$ref":"#/$defs/__schema0"}},{"type":"object","propertyNames":{"type":"string"},"additionalProperties":{"$ref":"#/$defs/__schema0"}}]}}}}]}`
+	r, err := parseResponses([]byte(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := buildGemini(r, "gemini-4-argon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pjs := gjson.GetBytes(b, "tools.0.functionDeclarations.0.parametersJsonSchema")
+	if !pjs.IsObject() {
+		t.Fatalf("parametersJsonSchema missing: %s", b)
+	}
+	if ap := pjs.Get(`$defs.__schema0.anyOf.5.additionalProperties`); ap.Raw != "{}" {
+		t.Fatalf("anyOf.5.additionalProperties = %s, want {}", ap.Raw)
+	}
+	if items := pjs.Get(`$defs.__schema0.anyOf.4.items.$ref`); items.String() != "#/$defs/__schema0" {
+		t.Fatalf("anyOf.4.items.$ref = %q, want #/$defs/__schema0", items.String())
+	}
+	if pjs.Get("additionalProperties").Raw != "false" {
+		t.Fatalf("root additionalProperties = %s, want false", pjs.Get("additionalProperties").Raw)
+	}
+}

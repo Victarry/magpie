@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -178,6 +179,20 @@ func geminiSchemaType(root, s gjson.Result, isRoot bool) string {
 //
 // A schema with neither goes byte for byte as it came; one with either is
 // written again in its own order.
+// geminiJSONSchema is raw with boolean schemas, x- keywords, and $ref
+// loops through additionalProperties removed for Gemini's
+// parametersJsonSchema and responseJsonSchema.
+func geminiJSONSchema(raw json.RawMessage) json.RawMessage {
+	root := gjson.ParseBytes(raw)
+	if !root.IsObject() || !schemaNeedsShape(root, true) {
+		return raw
+	}
+	if shaped, keep := shapeSchema(root); keep {
+		return json.RawMessage(shaped)
+	}
+	return raw
+}
+
 func geminiSchemaShapes(body []byte) []byte {
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.IsArray() {
@@ -188,15 +203,25 @@ func geminiSchemaShapes(body []byte) []byte {
 		raw      string
 	}
 	var cuts []cut
+	cutRoot := func(root gjson.Result) {
+		if !root.IsObject() || root.Index <= 0 || !schemaNeedsShape(root, true) {
+			return
+		}
+		if raw, keep := shapeSchema(root); keep && root.Index+len(root.Raw) <= len(body) && string(body[root.Index:root.Index+len(root.Raw)]) == root.Raw {
+			cuts = append(cuts, cut{root.Index, root.Index + len(root.Raw), raw})
+		}
+	}
 	tools.ForEach(func(_, tool gjson.Result) bool {
 		for _, at := range []string{"function.parameters", "parameters", "input_schema"} {
-			root := tool.Get(at)
-			if !root.IsObject() || root.Index <= 0 || !schemaNeedsShape(root, true) {
-				continue
-			}
-			if raw, keep := shapeSchema(root); keep && root.Index+len(root.Raw) <= len(body) && string(body[root.Index:root.Index+len(root.Raw)]) == root.Raw {
-				cuts = append(cuts, cut{root.Index, root.Index + len(root.Raw), raw})
-			}
+			cutRoot(tool.Get(at))
+		}
+		if decls := tool.Get("functionDeclarations"); decls.IsArray() {
+			decls.ForEach(func(_, d gjson.Result) bool {
+				for _, at := range []string{"parameters", "parametersJsonSchema"} {
+					cutRoot(d.Get(at))
+				}
+				return true
+			})
 		}
 		return true
 	})
@@ -227,8 +252,44 @@ var (
 	schemaList = map[string]bool{"anyOf": true, "oneOf": true, "allOf": true, "prefixItems": true}
 )
 
+// schemaHasRef reports whether node, a schema, carries a $ref anywhere
+// under it. Gemini's schema compiler rejects $ref loops that pass through
+// additionalProperties, unevaluatedProperties, or patternProperties
+// ("ref loops are only supported if they include optional or nullable
+// property values, or a potentially-zero-length array items, but a ref
+// loop of required fields was found at $defs.__schema0.anyOf.5.additionalProperties").
+func schemaHasRef(node gjson.Result) bool {
+	if !node.IsObject() || !strings.Contains(node.Raw, `"$ref"`) {
+		return false
+	}
+	if node.Get(`\$ref`).Exists() {
+		return true
+	}
+	found := false
+	node.ForEach(func(key, v gjson.Result) bool {
+		k := key.String()
+		switch {
+		case schemaMaps[k] && v.IsObject():
+			v.ForEach(func(_, s gjson.Result) bool {
+				found = schemaHasRef(s)
+				return !found
+			})
+		case schemaOne[k], k == "additionalProperties", k == "unevaluatedProperties", k == "unevaluatedItems":
+			found = schemaHasRef(v)
+		case schemaList[k] && v.IsArray():
+			v.ForEach(func(_, s gjson.Result) bool {
+				found = schemaHasRef(s)
+				return !found
+			})
+		}
+		return !found
+	})
+	return found
+}
+
 // schemaNeedsShape is whether node, a schema when isSchema, holds a
-// boolean schema or an x- keyword anywhere under it.
+// boolean schema, an x- keyword, or a $ref inside additionalProperties /
+// unevaluatedProperties / patternProperties anywhere under it.
 func schemaNeedsShape(node gjson.Result, isSchema bool) bool {
 	if isSchema && (node.Type == gjson.True || node.Type == gjson.False) {
 		return true
@@ -242,11 +303,24 @@ func schemaNeedsShape(node gjson.Result, isSchema bool) bool {
 		switch {
 		case strings.HasPrefix(k, "x-"):
 			need = true
+		case k == "patternProperties" && v.IsObject():
+			v.ForEach(func(_, s gjson.Result) bool {
+				need = schemaHasRef(s) || schemaNeedsShape(s, true)
+				return !need
+			})
 		case schemaMaps[k]:
 			v.ForEach(func(_, s gjson.Result) bool {
 				need = schemaNeedsShape(s, true)
 				return !need
 			})
+		case k == "additionalProperties" || k == "unevaluatedProperties":
+			if v.IsObject() {
+				need = schemaHasRef(v) || schemaNeedsShape(v, true)
+			}
+		case k == "unevaluatedItems":
+			if v.IsObject() {
+				need = schemaNeedsShape(v, true)
+			}
 		case schemaOne[k]:
 			need = schemaNeedsShape(v, true)
 		case schemaList[k]:
@@ -260,8 +334,9 @@ func schemaNeedsShape(node gjson.Result, isSchema bool) bool {
 	return need
 }
 
-// shapeSchema is schema s written again without its boolean schemas and
-// x- keywords; keep is false when s itself is false, no schema at all.
+// shapeSchema is schema s written again without its boolean schemas,
+// x- keywords, and $ref loops in additionalProperties; keep is false when
+// s itself is false, no schema at all.
 func shapeSchema(s gjson.Result) (raw string, keep bool) {
 	switch s.Type {
 	case gjson.True:
@@ -288,6 +363,33 @@ func shapeSchema(s gjson.Result) (raw string, keep bool) {
 		k := key.String()
 		switch {
 		case strings.HasPrefix(k, "x-"):
+		case k == "patternProperties" && v.IsObject():
+			var m strings.Builder
+			m.WriteByte('{')
+			n := 0
+			v.ForEach(func(name, sub gjson.Result) bool {
+				if schemaHasRef(sub) {
+					if n > 0 {
+						m.WriteByte(',')
+					}
+					n++
+					m.WriteString(name.Raw)
+					m.WriteString(":{}")
+					return true
+				}
+				if r, ok := shapeSchema(sub); ok {
+					if n > 0 {
+						m.WriteByte(',')
+					}
+					n++
+					m.WriteString(name.Raw)
+					m.WriteByte(':')
+					m.WriteString(r)
+				}
+				return true
+			})
+			m.WriteByte('}')
+			put(key.Raw, m.String())
 		case schemaMaps[k] && v.IsObject():
 			var m strings.Builder
 			m.WriteByte('{')
@@ -306,6 +408,16 @@ func shapeSchema(s gjson.Result) (raw string, keep bool) {
 			})
 			m.WriteByte('}')
 			put(key.Raw, m.String())
+		case (k == "additionalProperties" || k == "unevaluatedProperties") && v.IsObject():
+			if schemaHasRef(v) {
+				put(key.Raw, "{}")
+			} else if r, ok := shapeSchema(v); ok {
+				put(key.Raw, r)
+			}
+		case k == "unevaluatedItems" && v.IsObject():
+			if r, ok := shapeSchema(v); ok {
+				put(key.Raw, r)
+			}
 		case schemaOne[k]:
 			if r, ok := shapeSchema(v); ok {
 				put(key.Raw, r)

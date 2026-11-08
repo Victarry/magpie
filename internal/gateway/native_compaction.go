@@ -97,6 +97,7 @@ func (s *Server) compactsNatively(p provider.Provider, model string) bool {
 // vendor lists the model only to keys that speak no Responses there, as
 // with native compaction off, where the trigger was refused before.
 func (s *Server) nativeCompactionFor(asked string) bool {
+	asked = unprefixed(asked)
 	if _, ms, ok := provider.FindGroup(asked); ok {
 		if len(ms) == 0 {
 			return false

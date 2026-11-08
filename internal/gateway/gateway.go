@@ -1754,17 +1754,32 @@ func unprefixed(id string) string {
 	if real, ok := provider.ClaudeUndashed(id); ok {
 		return real
 	}
-	rest, ok := strings.CutPrefix(id, "anthropic/")
-	if !ok || rest == "" {
-		return id
+	if rest, ok := strings.CutPrefix(id, "anthropic/"); ok && rest != "" {
+		if _, _, ok := provider.Resolve(id); ok {
+			return id
+		}
+		if _, ok := provider.GroupFor(id); ok {
+			return id
+		}
+		return rest
 	}
-	if _, _, ok := provider.Resolve(id); ok {
-		return id
+	if _, rest, ok := strings.Cut(id, "/"); ok && strings.Contains(rest, "/") {
+		if _, _, ok := provider.Resolve(id); ok {
+			return id
+		}
+		if _, ok := provider.GroupFor(id); ok {
+			return id
+		}
+		if inner, _, ok := strings.Cut(rest, "/"); ok {
+			if p, err := provider.Find(inner); err == nil && p != nil && p.On() && !p.ServesNone() {
+				return rest
+			}
+			if _, ok := provider.GroupFor(rest); ok {
+				return rest
+			}
+		}
 	}
-	if _, ok := provider.GroupFor(id); ok {
-		return id
-	}
-	return rest
+	return id
 }
 
 // askedAt splits a model asked for at an effort of its own,
@@ -6088,7 +6103,10 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		if p.Account == nil || p.Account.Agent != "codex" {
 			body, searchFn = searchAsFunction(body)
 		}
-		body = forVendor(p, body, asksCompaction(r.Context()))
+		body = forVendor(p, body, asksCompaction(r.Context()) && s.fits(p.ID, systemRoleRefused(model), proto))
+		if !s.fits(p.ID, systemRoleRefused(model), proto) {
+			body = systemItemsAsDeveloper(body)
+		}
 		// Ark takes web_search in the shape its docs give, and only the include
 		// values it knows (search_ark.go)
 		body = forArkSearch(p, body)
@@ -6534,6 +6552,16 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 					}
 					continue
 				}
+			}
+		}
+		if len(fs) == 0 && len(ms) == 0 && proto == provider.Responses && refusesSystemRole(res.StatusCode, b) {
+			if nb := systemItemsAsDeveloper(body); !bytes.Equal(nb, body) {
+				refused = append(refused, systemRoleRefused(model))
+				body = nb
+				if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(body), r.Header); err != nil {
+					return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+				}
+				continue
 			}
 		}
 		if len(fs) == 0 && len(ms) == 0 && proto == provider.Responses && !replay && refusesReasoningText(res.StatusCode, b, body) {
